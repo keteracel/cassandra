@@ -30,6 +30,9 @@ import com.google.common.collect.ImmutableList;
 import org.apache.cassandra.batchlog.Batch;
 import org.apache.cassandra.batchlog.BatchRemoveVerbHandler;
 import org.apache.cassandra.batchlog.BatchStoreVerbHandler;
+import org.apache.cassandra.compute.EntryProcessorRequest;
+import org.apache.cassandra.compute.EntryProcessorRequestHandler;
+import org.apache.cassandra.compute.EntryProcessorResponse;
 import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.CounterMutation;
@@ -222,6 +225,12 @@ public enum Verb
     INTERNAL_RSP           (23,  P1, rpcTimeout,      INTERNAL_RESPONSE, () -> null,                                 () -> ResponseVerbHandler.instance                             ),
 
     // largest used ID: 116
+
+    // cassandra-compute: EntryProcessor/BackupEntryProcessor dispatch (see org.apache.cassandra.compute).
+    // There is deliberately no separate "backup" verb - a processor's delta is replicated via the normal
+    // MUTATION_REQ path once handed to StorageProxy.mutate(), see EntryProcessorRequestHandler.
+    ENTRYPROCESSOR_RSP     (118, P2, writeTimeout,    REQUEST_RESPONSE,  () -> EntryProcessorResponse.serializer,    () -> ResponseVerbHandler.instance                                  ),
+    ENTRYPROCESSOR_REQ     (117, P3, writeTimeout,    MUTATION,          () -> EntryProcessorRequest.serializer,     () -> EntryProcessorRequestHandler.instance, ENTRYPROCESSOR_RSP    ),
 
     // CUSTOM VERBS
     UNUSED_CUSTOM_VERB     (CUSTOM,

@@ -35,6 +35,7 @@ import org.apache.cassandra.schema.TableMetadata;
  */
 public final class SimpleEntryProcessorContext implements EntryProcessorContext
 {
+    private final TableMetadata table;
     private final DecoratedKey key;
     private final Row currentRow;
     private final Mutation.SimpleBuilder mutationBuilder;
@@ -42,6 +43,7 @@ public final class SimpleEntryProcessorContext implements EntryProcessorContext
 
     public SimpleEntryProcessorContext(String keyspaceName, TableMetadata table, DecoratedKey key, Row currentRow)
     {
+        this.table = table;
         this.key = key;
         this.currentRow = currentRow;
         this.mutationBuilder = Mutation.simpleBuilder(keyspaceName, key);
@@ -53,6 +55,12 @@ public final class SimpleEntryProcessorContext implements EntryProcessorContext
     public DecoratedKey key()
     {
         return key;
+    }
+
+    @Override
+    public TableMetadata table()
+    {
+        return table;
     }
 
     @Override

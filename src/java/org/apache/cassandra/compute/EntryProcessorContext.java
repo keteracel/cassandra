@@ -19,6 +19,7 @@ package org.apache.cassandra.compute;
 
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.schema.TableMetadata;
 
 /**
  * Passed to an {@link EntryProcessor} for a single invocation. {@link #currentRow()} is read locally — execution
@@ -30,6 +31,12 @@ import org.apache.cassandra.db.rows.Row;
 public interface EntryProcessorContext
 {
     DecoratedKey key();
+
+    /**
+     * The schema of the table this entry lives in — needed to resolve a {@link org.apache.cassandra.schema.ColumnMetadata}
+     * for a column name, which {@link Row#getCell} requires to read a typed value out of {@link #currentRow()}.
+     */
+    TableMetadata table();
 
     Row currentRow();
 

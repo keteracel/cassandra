@@ -20,7 +20,11 @@ package org.apache.cassandra.compute;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Collections;
+import java.util.concurrent.locks.Lock;
 
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.ReadExecutionController;
@@ -48,6 +52,10 @@ import org.apache.cassandra.utils.FBUtilities;
  * CQL-driven write would — replica resolution, {@code MUTATION_REQ} dispatch to the key's other natural replicas,
  * consistency-level ack counting, and hinted handoff are all unmodified Cassandra machinery, not something this
  * class re-implements.
+ * <p>
+ * {@link #execute} holds an {@link EntryLocks} per-key lock for the entire read-modify-write, so two concurrent
+ * {@link EntryProcessor} invocations for the same key can never interleave their reads and writes — see
+ * {@link EntryLocks} for exactly what this guarantee does and does not cover.
  */
 public final class EntryProcessorRequestHandler implements IVerbHandler<EntryProcessorRequest>
 {
@@ -83,31 +91,53 @@ public final class EntryProcessorRequestHandler implements IVerbHandler<EntryPro
                 "Could not instantiate processor " + request.processorClassName + ": " + e);
         }
 
-        Row currentRow = readLocalRow(table, key);
-        SimpleEntryProcessorContext ctx = new SimpleEntryProcessorContext(table.keyspace, table, key, currentRow);
-
-        ByteBuffer result;
+        // Serialize this key's read-modify-write against any other concurrent EntryProcessor invocation for the
+        // same key, mirroring CounterMutation's own striped-lock treatment of the same problem shape. See
+        // EntryLocks for what this does and does not cover.
+        Lock lock = EntryLocks.lockFor(request.tableId, key);
         try
         {
-            result = processor.process(ctx);
+            if (!lock.tryLock(DatabaseDescriptor.getWriteRpcTimeout(NANOSECONDS), NANOSECONDS))
+                return EntryProcessorResponse.writeFailure("Timed out waiting for exclusive access to key " + key);
         }
-        catch (Exception e)
+        catch (InterruptedException e)
         {
-            return EntryProcessorResponse.processorFailure(
-                "EntryProcessor " + request.processorClassName + " threw: " + e);
+            Thread.currentThread().interrupt();
+            return EntryProcessorResponse.writeFailure("Interrupted waiting for exclusive access to key " + key);
         }
 
-        Mutation mutation = ctx.buildMutation();
         try
         {
-            StorageProxy.mutate(Collections.singletonList(mutation), request.consistencyLevel, Dispatcher.RequestTime.forImmediateExecution());
-        }
-        catch (RequestExecutionException e)
-        {
-            return EntryProcessorResponse.writeFailure(e.toString());
-        }
+            Row currentRow = readLocalRow(table, key);
+            SimpleEntryProcessorContext ctx = new SimpleEntryProcessorContext(table.keyspace, table, key, currentRow);
 
-        return EntryProcessorResponse.success(result);
+            ByteBuffer result;
+            try
+            {
+                result = processor.process(ctx);
+            }
+            catch (Exception e)
+            {
+                return EntryProcessorResponse.processorFailure(
+                    "EntryProcessor " + request.processorClassName + " threw: " + e);
+            }
+
+            Mutation mutation = ctx.buildMutation();
+            try
+            {
+                StorageProxy.mutate(Collections.singletonList(mutation), request.consistencyLevel, Dispatcher.RequestTime.forImmediateExecution());
+            }
+            catch (RequestExecutionException e)
+            {
+                return EntryProcessorResponse.writeFailure(e.toString());
+            }
+
+            return EntryProcessorResponse.success(result);
+        }
+        finally
+        {
+            lock.unlock();
+        }
     }
 
     /**
@@ -115,7 +145,7 @@ public final class EntryProcessorRequestHandler implements IVerbHandler<EntryPro
      * decision that the read half of an EntryProcessor invocation needs no consistency level, since execution
      * only ever happens at the key's primary natural replica, which already holds the authoritative local copy.
      */
-    private static Row readLocalRow(TableMetadata table, DecoratedKey key)
+    static Row readLocalRow(TableMetadata table, DecoratedKey key)
     {
         long nowInSec = FBUtilities.nowInSeconds();
         SinglePartitionReadCommand command = SinglePartitionReadCommand.create(table, nowInSec, key, Slices.ALL);

@@ -18,7 +18,12 @@
 package org.apache.cassandra.compute;
 
 import java.util.Collections;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.locks.Lock;
 
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.Keyspace;
@@ -74,19 +79,32 @@ public final class EntryDispatch
      * <p>
      * Callers are responsible for having already confirmed locality via {@link EntryOwnership#isLocalPrimary};
      * this method does not check it, since re-checking here would defeat the point of exposing it separately from
-     * {@link #dispatch}.
+     * {@link #dispatch}. The read of the entry's current state happens inside this method (not before it), so the
+     * {@link EntryLocks} lock below covers the whole read-modify-write, exactly as {@link EntryProcessorRequestHandler#execute}
+     * does — a caller pre-reading the row itself would open the same race this lock exists to close.
      */
     public static <R> R invokeLocally(String keyspaceName,
                                        TableMetadata table,
                                        DecoratedKey key,
-                                       Row currentRow,
                                        EntryProcessor<R> processor,
                                        ConsistencyLevel consistencyLevel) throws Exception
     {
-        SimpleEntryProcessorContext ctx = new SimpleEntryProcessorContext(keyspaceName, table, key, currentRow);
-        R result = processor.process(ctx);
-        Mutation mutation = ctx.buildMutation();
-        StorageProxy.mutate(Collections.singletonList(mutation), consistencyLevel, Dispatcher.RequestTime.forImmediateExecution());
-        return result;
+        Lock lock = EntryLocks.lockFor(table.id, key);
+        if (!lock.tryLock(DatabaseDescriptor.getWriteRpcTimeout(NANOSECONDS), NANOSECONDS))
+            throw new TimeoutException("Timed out waiting for exclusive access to key " + key);
+
+        try
+        {
+            Row currentRow = EntryProcessorRequestHandler.readLocalRow(table, key);
+            SimpleEntryProcessorContext ctx = new SimpleEntryProcessorContext(keyspaceName, table, key, currentRow);
+            R result = processor.process(ctx);
+            Mutation mutation = ctx.buildMutation();
+            StorageProxy.mutate(Collections.singletonList(mutation), consistencyLevel, Dispatcher.RequestTime.forImmediateExecution());
+            return result;
+        }
+        finally
+        {
+            lock.unlock();
+        }
     }
 }

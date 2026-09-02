@@ -25,8 +25,10 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
+import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.cassandra.compute.ComputeQueryHandler;
 import org.apache.cassandra.compute.EntryDispatch;
 import org.apache.cassandra.compute.EntryOwnership;
 import org.apache.cassandra.compute.EntryProcessor;
@@ -56,15 +58,29 @@ import static org.junit.Assert.assertTrue;
 /**
  * Multi-node integration coverage for the compute layer (org.apache.cassandra.compute): verifies EntryProcessor
  * routes to the correct primary owner, its delta replicates to the backup owner via Cassandra's own write path
- * (not a separate BackupEntryProcessor mechanism — see specs/technical.md), and concurrent invocations for the
- * same key are serialized by EntryLocks so no updates are lost.
+ * (not a separate BackupEntryProcessor mechanism — see specs/technical.md), concurrent invocations for the same
+ * key are serialized by EntryLocks so no updates are lost, and the CQL client-facing entry point
+ * ({@link ComputeQueryHandler}) actually dispatches an EntryProcessor when swapped in via the
+ * {@code cassandra.custom_query_handler_class} system property.
  * <p>
- * There is no client-facing entry point yet (the CQL QueryHandler is a later implementation-plan step), so this
- * test invokes {@link EntryDispatch} directly from inside each instance via {@code callOnInstance} — which is
- * exactly the mechanism under test, not a shortcut around it.
+ * The first two concerns are tested by invoking {@link EntryDispatch} directly from inside each instance via
+ * {@code callOnInstance} — the mechanism under test, not a shortcut around it, since there's no other way to reach
+ * it before the CQL entry point exists. The third test exercises that CQL entry point itself, through
+ * {@code coordinator().execute(...)} (the dtest API's full client-simulating path, unlike {@code executeInternal}
+ * which bypasses {@code ClientState}'s query-handler swap point entirely).
  */
 public class EntryProcessorDistributedTest extends TestBaseImpl
 {
+    @BeforeClass
+    public static void setCustomQueryHandler()
+    {
+        // Must be set before any instance's ClientState class initializes (each instance loads its own copy in
+        // its own classloader, but they all read the same JVM-wide system property at that moment) - hence
+        // @BeforeClass rather than setting it inside the test method that needs it.
+        System.setProperty("cassandra.custom_query_handler_class", ComputeQueryHandler.class.getName());
+    }
+
+
     /**
      * Reads the "val" int column, increments it by one, and writes it back as a partial update — exercises
      * {@link EntryProcessorContext#currentRow()}/{@link EntryProcessorContext#table()}/{@link EntryProcessorContext#delta()}
@@ -237,6 +253,78 @@ public class EntryProcessorDistributedTest extends TestBaseImpl
 
             assertEquals("no update should be lost under concurrent EntryProcessor invocations for the same key",
                          (Integer) concurrency, readVal(primary, key));
+        }
+    }
+
+    @Test
+    public void cqlEntryPointDispatchesEntryProcessor() throws Exception
+    {
+        try (Cluster cluster = init(Cluster.build(3).withConfig(config -> config.with(GOSSIP, NETWORK)).start(), 2))
+        {
+            cluster.schemaChange(withKeyspace("CREATE TABLE %s.widgets (id text PRIMARY KEY, val int)"));
+
+            String key = "cql-widget";
+            String call = String.format("CALL ENTRYPROCESSOR('%s', 'widgets', '%s', '%s', 'ALL')",
+                                         KEYSPACE, key, IncrementProcessor.class.getName());
+
+            IInvokableInstance instance = cluster.get(1);
+
+            // Confirm the swap itself actually took effect on a real node: ClientState reads the
+            // cassandra.custom_query_handler_class system property once, in its own static initializer.
+            String activeHandlerClass = instance.callOnInstance((SerializableCallable<String>) () ->
+                org.apache.cassandra.service.ClientState.getCQLQueryHandler().getClass().getName());
+            assertEquals(ComputeQueryHandler.class.getName(), activeHandlerClass);
+
+            // Exercise the actual QueryHandler.parse()/process() path a real client connection over the native
+            // protocol would trigger. coordinator().execute()/executeInternal() both call QueryProcessor directly
+            // in this dtest framework version, bypassing ClientState's swap point entirely - so this drives the
+            // swapped handler's own parse()+process() methods directly instead, which is what actually needs
+            // proving here.
+            int result = instance.callOnInstance((SerializableCallable<Integer>) () -> {
+                org.apache.cassandra.cql3.QueryHandler handler = org.apache.cassandra.service.ClientState.getCQLQueryHandler();
+                org.apache.cassandra.service.QueryState queryState = org.apache.cassandra.service.QueryState.forInternalCalls();
+                org.apache.cassandra.cql3.QueryOptions options = org.apache.cassandra.cql3.QueryOptions.DEFAULT;
+                org.apache.cassandra.cql3.CQLStatement statement = handler.parse(call, queryState, options);
+                org.apache.cassandra.transport.messages.ResultMessage message =
+                    handler.process(statement, queryState, options, java.util.Collections.emptyMap(),
+                                     org.apache.cassandra.transport.Dispatcher.RequestTime.forImmediateExecution());
+                org.apache.cassandra.transport.messages.ResultMessage.Rows rows =
+                    (org.apache.cassandra.transport.messages.ResultMessage.Rows) message;
+                ByteBuffer bytes = rows.result.rows.get(0).get(0);
+                return Int32Type.instance.compose(bytes);
+            });
+            assertEquals(1, result);
+
+            // The fallback path in parse() must still work: normal CQL through the same swapped handler. The
+            // insert string is built here, outside the callOnInstance lambda - withKeyspace() is a method on our
+            // own test class, which isn't necessarily available on the isolated instance's own classloader.
+            String insert = withKeyspace("INSERT INTO %s.widgets (id, val) VALUES ('normal-cql-check', 42)");
+            int normalCqlResult = instance.callOnInstance((SerializableCallable<Integer>) () -> {
+                org.apache.cassandra.cql3.QueryHandler handler = org.apache.cassandra.service.ClientState.getCQLQueryHandler();
+                org.apache.cassandra.service.QueryState queryState = org.apache.cassandra.service.QueryState.forInternalCalls();
+                org.apache.cassandra.cql3.QueryOptions options = org.apache.cassandra.cql3.QueryOptions.DEFAULT;
+                org.apache.cassandra.cql3.CQLStatement statement = handler.parse(insert, queryState, options);
+                handler.process(statement, queryState, options, java.util.Collections.emptyMap(),
+                                 org.apache.cassandra.transport.Dispatcher.RequestTime.forImmediateExecution());
+                return 1;
+            });
+            assertEquals(1, normalCqlResult);
+            // readVal() reads locally on whichever instance it's given, via executeInternal - it must be pointed
+            // at a node that actually owns "normal-cql-check" (a different key, different token, likely different
+            // owning nodes than "cql-widget"), not just any node.
+            IInvokableInstance normalCqlOwner = null;
+            for (int i = 1; i <= 3; i++)
+                if (isPrimary(cluster.get(i), "normal-cql-check"))
+                    normalCqlOwner = cluster.get(i);
+            assertEquals((Integer) 42, readVal(normalCqlOwner, "normal-cql-check"));
+
+            IInvokableInstance primary = null;
+            for (int i = 1; i <= 3; i++)
+                if (isPrimary(cluster.get(i), key))
+                    primary = cluster.get(i);
+
+            assertEquals("the CQL-dispatched EntryProcessor should actually have applied its delta",
+                         (Integer) 1, readVal(primary, key));
         }
     }
 }

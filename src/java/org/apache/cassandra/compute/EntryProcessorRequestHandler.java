@@ -56,6 +56,12 @@ import org.apache.cassandra.utils.FBUtilities;
  * {@link #execute} holds an {@link EntryLocks} per-key lock for the entire read-modify-write, so two concurrent
  * {@link EntryProcessor} invocations for the same key can never interleave their reads and writes — see
  * {@link EntryLocks} for exactly what this guarantee does and does not cover.
+ * <p>
+ * The mutation is applied to the local replica synchronously (via {@code Mutation.apply()}) before being handed to
+ * {@code StorageProxy.mutate}, so the next invocation for this key is always guaranteed to see it once it acquires
+ * the lock — {@code StorageProxy.mutate}'s own local application races the other natural replicas' acks to satisfy
+ * whatever {@code ConsistencyLevel} the caller requested, and can return before the local apply has actually run
+ * under anything short of {@code ALL}. See the inline comment at the call site for the full explanation.
  */
 public final class EntryProcessorRequestHandler implements IVerbHandler<EntryProcessorRequest>
 {
@@ -125,6 +131,18 @@ public final class EntryProcessorRequestHandler implements IVerbHandler<EntryPro
             Mutation mutation = ctx.buildMutation();
             try
             {
+                // Apply locally first, synchronously, before handing off to StorageProxy. StorageProxy.mutate's
+                // own local-replica application (inside performLocally) is submitted asynchronously to the
+                // MUTATION stage, and its ack races the other natural replicas' acks to satisfy the requested
+                // ConsistencyLevel - under CL.ONE (or anything short of ALL) with more than one replica, mutate()
+                // can return as soon as a *remote* replica acks, before our own local apply has actually run. The
+                // next EntryProcessor invocation for this key (waiting on EntryLocks right now) must always see
+                // this write once it acquires the lock, regardless of what ConsistencyLevel the caller requested
+                // for cluster-wide durability - that's an internal correctness requirement of this handler, not
+                // something the caller's CL choice should be able to weaken. Re-applying via StorageProxy.mutate
+                // below is a harmless idempotent no-op for the local replica (same delta, same timestamp) and is
+                // still what performs replication to the other natural replicas at the requested CL.
+                mutation.apply();
                 StorageProxy.mutate(Collections.singletonList(mutation), request.consistencyLevel, Dispatcher.RequestTime.forImmediateExecution());
             }
             catch (RequestExecutionException e)

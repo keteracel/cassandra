@@ -99,6 +99,9 @@ public final class EntryDispatch
             SimpleEntryProcessorContext ctx = new SimpleEntryProcessorContext(keyspaceName, table, key, currentRow);
             R result = processor.process(ctx);
             Mutation mutation = ctx.buildMutation();
+            // Apply locally first, synchronously - see the comment at the equivalent call site in
+            // EntryProcessorRequestHandler.execute() for why StorageProxy.mutate() alone doesn't guarantee this.
+            mutation.apply();
             StorageProxy.mutate(Collections.singletonList(mutation), consistencyLevel, Dispatcher.RequestTime.forImmediateExecution());
             return result;
         }

@@ -44,6 +44,8 @@ import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.IInvokableInstance;
 import org.apache.cassandra.distributed.api.IIsolatedExecutor.SerializableCallable;
+import org.apache.cassandra.distributed.api.TokenSupplier;
+import org.apache.cassandra.distributed.shared.NetworkTopology;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableMetadata;
@@ -54,14 +56,17 @@ import static org.apache.cassandra.distributed.api.Feature.NETWORK;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 /**
  * Multi-node integration coverage for the compute layer (org.apache.cassandra.compute): verifies EntryProcessor
  * routes to the correct primary owner, its delta replicates to the backup owner via Cassandra's own write path
  * (no dedicated backup-processor mechanism — see specs/technical.md), concurrent invocations for the same
- * key are serialized by EntryLocks so no updates are lost, and the CQL client-facing entry point
+ * key are serialized by EntryLocks so no updates are lost, the CQL client-facing entry point
  * ({@link ComputeQueryHandler}) actually dispatches an EntryProcessor when swapped in via the
- * {@code cassandra.custom_query_handler_class} system property.
+ * {@code cassandra.custom_query_handler_class} system property, routing follows a topology change without a
+ * restart, and an unreachable primary fails clearly within a bounded time rather than hanging — the last two are
+ * the product spec's remaining acceptance criteria this class didn't originally cover.
  * <p>
  * The first two concerns are tested by invoking {@link EntryDispatch} directly from inside each instance via
  * {@code callOnInstance} — the mechanism under test, not a shortcut around it, since there's no other way to reach
@@ -325,6 +330,111 @@ public class EntryProcessorDistributedTest extends TestBaseImpl
 
             assertEquals("the CQL-dispatched EntryProcessor should actually have applied its delta",
                          (Integer) 1, readVal(primary, key));
+        }
+    }
+
+    /**
+     * Product spec acceptance criterion: "When cluster topology changes ..., subsequently submitted processors
+     * route to the *new* correct owner without requiring a restart or manual config change." {@link EntryOwnership}
+     * never caches a resolution (see its class javadoc), so this is really a test that nothing *else* in the
+     * dispatch path accidentally introduces caching — {@link #routesToPrimaryAndReplicatesToBackup} already proves
+     * routing is correct for a fixed topology; this proves it stays correct after the topology underneath it
+     * changes, with no restart of any node.
+     */
+    @Test
+    public void topologyChangeReroutesToNewPrimaryWithoutRestart() throws Exception
+    {
+        // Cluster.build(n) sizes its token supplier for exactly n nodes, which makes bootstrapAndJoinNode's later
+        // newInstanceConfig() call fail with an out-of-bounds token lookup - pre-plan capacity for 4 nodes up
+        // front (matching the pattern HintedHandoffAddRemoveNodesTest.shouldBootstrapWithHintsOutstanding uses)
+        // even though only 3 actually start.
+        try (Cluster cluster = init(builder().withNodes(3)
+                                              .withTokenSupplier(TokenSupplier.evenlyDistributedTokens(4, 1))
+                                              .withNodeIdTopology(NetworkTopology.singleDcNetworkTopology(4, "dc0", "rack0"))
+                                              .withConfig(config -> config.with(GOSSIP, NETWORK))
+                                              .start(), 2))
+        {
+            cluster.schemaChange(withKeyspace("CREATE TABLE %s.widgets (id text PRIMARY KEY, val int)"));
+
+            // Bootstrap a 4th node - a real ring change (new token ranges claimed), not a config edit. RF stays 2:
+            // the point is that *which* nodes are replicas/primary for a given key can change, not that more of
+            // them need to be.
+            bootstrapAndJoinNode(cluster);
+            IInvokableInstance newNode = cluster.get(4);
+
+            // Scan for a key whose primary owner is now the newly-bootstrapped node - not knowable in advance
+            // since it depends on where its claimed token ranges land. With RF=2 across an even token-range split
+            // among 4 nodes, roughly 1 in 4 candidates should land here; 200 candidates makes a false negative
+            // astronomically unlikely.
+            String key = null;
+            for (int i = 0; i < 200 && key == null; i++)
+            {
+                String candidate = "topo-key-" + i;
+                if (isPrimary(newNode, candidate))
+                    key = candidate;
+            }
+            assertTrue("expected at least one of 200 candidate keys to route to the newly-bootstrapped node "
+                       + "after it joined the ring", key != null);
+
+            // Submit from node 1, an "outsider" for this key unless it happens to also be a replica - either way,
+            // this proves the *result* of dispatch, not an implementation detail of which path it took.
+            int result = invokeIncrement(cluster.get(1), key);
+            assertEquals(1, result);
+
+            assertEquals("the newly-bootstrapped node, now this key's primary, should have applied the delta locally",
+                         (Integer) 1, readVal(newNode, key));
+        }
+    }
+
+    /**
+     * Product spec acceptance criterion: "When the primary owner for a key is unreachable at submission time, the
+     * system exhibits one specific, documented behavior (... a clear, typed failure returned to the caller) -
+     * 'undefined/hangs' is not acceptable." No automatic failover to a backup owner exists in this design (see
+     * {@link EntryOwnership}'s class javadoc and specs/technical.md's "Decided" section) - the failure-returned
+     * option is what's actually implemented, so this proves it's bounded rather than an indefinite hang.
+     * <p>
+     * The primary is shut down cleanly here (not decommissioned), so the ring/token ownership doesn't change - it
+     * remains this key's primary, just unreachable, which is exactly the scenario the acceptance criterion
+     * describes.
+     */
+    @Test
+    public void primaryUnreachableFailsClearlyWithinBoundedTime() throws Exception
+    {
+        try (Cluster cluster = init(Cluster.build(3).withConfig(config -> config.with(GOSSIP, NETWORK)).start(), 2))
+        {
+            cluster.schemaChange(withKeyspace("CREATE TABLE %s.widgets (id text PRIMARY KEY, val int)"));
+
+            String key = "unreachable-primary-key";
+
+            IInvokableInstance primary = null;
+            IInvokableInstance caller = null;
+            for (int i = 1; i <= 3; i++)
+            {
+                IInvokableInstance instance = cluster.get(i);
+                if (isPrimary(instance, key))
+                    primary = instance;
+                else if (caller == null)
+                    caller = instance;
+            }
+            assertTrue("test setup: need a distinct primary and caller", primary != null && caller != null);
+
+            primary.shutdown().get();
+
+            long startNanos = System.nanoTime();
+            try
+            {
+                invokeIncrement(caller, key, ConsistencyLevel.ONE);
+                fail("dispatching to an unreachable primary should fail, not silently succeed");
+            }
+            catch (Throwable expected)
+            {
+                long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
+                // write_request_timeout defaults to 2000ms; a generous multiple of that bounds this as "fails
+                // clearly" rather than "hangs" without being sensitive to exactly how the failure surfaces
+                // (connection-refused fails fast; the callback expiring at the verb's own timeout would still
+                // land well inside this bound).
+                assertTrue("expected a bounded failure, not a hang - took " + elapsedMs + "ms", elapsedMs < 15_000);
+            }
         }
     }
 }

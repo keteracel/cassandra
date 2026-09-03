@@ -58,7 +58,7 @@ import static org.junit.Assert.assertTrue;
 /**
  * Multi-node integration coverage for the compute layer (org.apache.cassandra.compute): verifies EntryProcessor
  * routes to the correct primary owner, its delta replicates to the backup owner via Cassandra's own write path
- * (not a separate BackupEntryProcessor mechanism — see specs/technical.md), concurrent invocations for the same
+ * (no dedicated backup-processor mechanism — see specs/technical.md), concurrent invocations for the same
  * key are serialized by EntryLocks so no updates are lost, and the CQL client-facing entry point
  * ({@link ComputeQueryHandler}) actually dispatches an EntryProcessor when swapped in via the
  * {@code cassandra.custom_query_handler_class} system property.

@@ -78,7 +78,7 @@ public final class SimpleEntryProcessorContext implements EntryProcessorContext
     /**
      * Builds the {@link Mutation} representing everything the processor wrote via {@link #delta()}. This is the
      * value handed to Cassandra's normal write path ({@code StorageProxy.mutate}) — see the technical spec's
-     * "BackupEntryProcessor is not user-authored logic" decision.
+     * "backup replication needs no separate processor or mechanism" decision.
      */
     public Mutation buildMutation()
     {

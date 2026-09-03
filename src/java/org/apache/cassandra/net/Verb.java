@@ -226,7 +226,7 @@ public enum Verb
 
     // largest used ID: 116
 
-    // cassandra-compute: EntryProcessor/BackupEntryProcessor dispatch (see org.apache.cassandra.compute).
+    // cassandra-compute: EntryProcessor dispatch (see org.apache.cassandra.compute).
     // There is deliberately no separate "backup" verb - a processor's delta is replicated via the normal
     // MUTATION_REQ path once handed to StorageProxy.mutate(), see EntryProcessorRequestHandler.
     ENTRYPROCESSOR_RSP     (118, P2, writeTimeout,    REQUEST_RESPONSE,  () -> EntryProcessorResponse.serializer,    () -> ResponseVerbHandler.instance                                  ),

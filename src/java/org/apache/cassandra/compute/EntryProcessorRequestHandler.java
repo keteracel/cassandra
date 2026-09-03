@@ -47,8 +47,8 @@ import org.apache.cassandra.utils.FBUtilities;
  * Handles {@code Verb.ENTRYPROCESSOR_REQ}: resolves the target table and key, reads the current row locally,
  * runs the requested {@link EntryProcessor}, and hands its delta to Cassandra's own write path.
  * <p>
- * This is also where the technical spec's core claim is realized in code: there is no separate
- * {@code BackupEntryProcessor} dispatch here. {@link #execute} calls {@code StorageProxy.mutate} exactly as any
+ * This is also where the technical spec's core claim is realized in code: backup replication needs no dedicated
+ * dispatch here. {@link #execute} calls {@code StorageProxy.mutate} exactly as any
  * CQL-driven write would — replica resolution, {@code MUTATION_REQ} dispatch to the key's other natural replicas,
  * consistency-level ack counting, and hinted handoff are all unmodified Cassandra machinery, not something this
  * class re-implements.

@@ -32,6 +32,8 @@ import org.apache.cassandra.cql3.ResultSet;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.AsciiType;
 import org.apache.cassandra.db.marshal.BytesType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.exceptions.InvalidRequestException;
@@ -120,8 +122,30 @@ public final class EntryProcessorCallStatement implements CQLStatement
     @Override
     public void validate(ClientState state)
     {
-        if (Schema.instance.getTableMetadata(keyspace, table) == null)
+        TableMetadata metadata = Schema.instance.getTableMetadata(keyspace, table);
+        if (metadata == null)
             throw new InvalidRequestException("Unknown table: " + keyspace + "." + table);
+
+        checkTextPartitionKey(metadata);
+    }
+
+    /**
+     * Enforces the v1 scope limit documented on this class: the key argument is always decomposed via
+     * {@link UTF8Type}, so a table whose partition key isn't {@code text}/{@code varchar}/{@code ascii} would
+     * otherwise get a spurious partition written with the wrong byte length for its key type — which doesn't just
+     * fail this call, it corrupts later reads of the *whole table* for every other caller (a raw
+     * {@code IndexOutOfBoundsException} decoding that partition's key, not a clean, catchable error). Reject the
+     * call outright instead, since a wrong-shaped table is knowable up front and never becomes valid mid-call - no
+     * need to repeat this check in {@link #doExecute()}, unlike the table-existence check above (which can
+     * legitimately change between validate() and execute() via a concurrent DROP TABLE).
+     */
+    private void checkTextPartitionKey(TableMetadata metadata)
+    {
+        AbstractType<?> keyType = metadata.partitionKeyType;
+        if (!(keyType instanceof UTF8Type) && !(keyType instanceof AsciiType))
+            throw new InvalidRequestException(
+                "CALL ENTRYPROCESSOR only supports text/varchar/ascii partition keys, but "
+                + keyspace + "." + table + " has partition key type " + keyType.asCQL3Type());
     }
 
     @Override
